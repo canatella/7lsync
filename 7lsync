@@ -1,0 +1,180 @@
+#!/usr/bin/ruby
+# Copyright (c) 2013 Damien Merenne
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+require 'rubygems'
+require 'mechanize'
+require 'logger'
+require 'date'
+require 'yaml'
+require 'fileutils'
+require 'io/console'
+
+def returning(value)
+  yield value
+  value
+end
+  
+class LSync
+  URL = {
+    :eu => "eu.7digital.com"
+  }
+
+  class AuthenticationError < RuntimeError
+  end
+
+  class Track
+    attr_accessor :number, :title, :duration, :url
+
+    class << self
+      def from_element(li)
+        returning Track.new do |track|
+          track.number = li.children.first.text.gsub(/\D/, "").to_i
+          track.title = li.at("a").text
+          track.duration = li.at("span").text.gsub(/[^0-9:]/, "")
+          track.url = li.at("a")["href"]
+        end
+      end
+    end
+
+    def download(lsync, directory)
+      file = lsync.agent.get(lsync.url(url, "http"))
+      file.save(File.join(directory, file.filename))
+    end
+  end
+
+  class Album
+    attr_accessor :title, :artist, :purchase_date, :artwork, :track_count, :tracks
+
+    class << self
+      def from_element(tr)
+        returning Album.new do |album|
+          album.title = tr.at("td.trackdetails a.title").text
+          album.artist = tr.at("td.trackartist a.artist").text
+          album.purchase_date = Date.strptime(tr.at("td.trackpurchasedate span").text, "%d/%m/%Y")
+          album.track_count =  tr.at("td.trackdetails span.trackscount").text.gsub(/\D/, "").to_i
+          tr.search("td.trackdetails .tracklisting li").each do |li|
+            album.tracks.push(Track.from_element(li))
+          end
+        end
+      end
+    end
+
+    def initialize
+      @tracks = []
+    end
+  end
+
+  attr_reader :agent, :log
+  def initialize
+    @agent = Mechanize.new
+    @log = Logger.new(STDERR)
+    @log.level = Logger::INFO
+    @agent.user_agent_alias = "Windows IE 9"
+    @country = :eu
+    @config_filename = File.join(ENV["HOME"], ".7lsync.yml")
+    if File.exists?(@config_filename)
+      @config = YAML::load_file(@config_filename)
+    else
+      @config = {}
+    end
+  end
+
+  def save_config
+    File.open(@config_filename, "w", 0600) do |file|
+      file.write(@config.to_yaml)
+    end
+  end
+
+  def url(url, proto = "https")
+    "#{proto}://#{URL[@country]}#{url}"
+  end
+
+  def head(uri, query_params = {}, headers = {}, &block)
+    @agent.head(self.url(uri), query_params = {}, headers = {}, &block)
+  end
+
+  def get(url, parameters = [], referer = nil, headers = {}, &block)
+    @agent.get(self.url(url), parameters, referer, headers, &block)
+  end
+
+  def post(url, query = {}, headers = {})
+    @agent.post(self.url(url), query, headers)
+  end
+
+  def login
+    log.debug("authenticating")
+    unless @config["credentials"]
+      print "7digital email: "
+      @config["credentials"] = { "email" => STDIN.gets.chomp }
+      print "7digital password: "
+      @config["credentials"]["password"] = STDIN.noecho { STDIN.gets.chomp }
+      save_config
+    end
+    page = post("/signin/signin", @config["credentials"])
+    raise AuthenticationError if page.at("#signin-link")
+    self
+  end
+
+  def music(date = nil)
+    list = []
+    catch (:done) do
+      next_page = "?pagesize=10&page=1&sortBy=PurchaseDate&sortOrder=Descending"
+      while next_page do
+        log.debug("fetching page /yourmusic#{next_page}")
+        page = get("/yourmusic#{next_page}")
+        puts page.at(".digit-pager")
+        page.search("#downloads-list tbody tr").each do |tr|
+            
+          album = Album.from_element(tr)
+          log.debug("fetched #{album.title}")
+          
+          # if we bought this before the last run date, we already have it
+          throw :done if date and album.purchase_date <= date
+          
+          list.push(album)
+        end
+        next_page = (page.at(".digit-pager .next a") || {})["href"]
+      end
+    end
+    log.debug("fetched music collection")
+    list.sort { |a, b| a.purchase_date <=> b.purchase_date }
+  end
+
+  def synchronize(directory)
+    @config["directory"] = directory if directory
+    music(@config["last_update"]).each do |album|
+      log.info("fetching #{album.artist} #{album.title}")
+      path = File.join(@config["directory"], album.artist[0,1].downcase, album.artist, album.title)
+      FileUtils.mkdir_p path
+      album.tracks.each do |track|
+        log.info("downloading #{track.title} to #{path}")
+        track.download(self, path)
+      end
+      @config["last_update"] = album.purchase_date 
+    end
+    @config["last_update"] = Date.today
+    save_config
+    self
+  end
+end
+
+LSync.new.login.synchronize(ARGV.first)
+
